@@ -3,19 +3,19 @@ Utility package for plotting and other helpers used in textbook solution noteboo
 """
 
 from .plot_utils import (
-    PiecewiseLine,
+    RangeVar,
     VerticalLine,
-    HorizontalLine,
-    SubplotConfig,
-    plot_lines,
-    plot_combined,
+    Payoff,
+    Panel,
+    plot_payoffs,
+    plot_panels,
 )
 
 __all__ = [
-    "PiecewiseLine",
-    "VerticalLine",
-    "HorizontalLine",
-    "SubplotConfig",
-    "plot_lines",
-    "plot_combined",
+    'RangeVar', 
+    'Payoff',
+    'VerticalLine',
+    'Panel',
+    'plot_payoffs',
+    'plot_panels'
 ]

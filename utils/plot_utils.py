@@ -1,186 +1,214 @@
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Union, Tuple, Sequence
+from __future__ import annotations
+"""Payoff plotting utilities.
 
+Goals:
+- Single, simple API that subsumes earlier `PiecewiseLine` / `HorizontalLine` usage.
+- Support for: piecewise masking, vertical lines, point highlights, subplots.
+
+Core Concepts
+-------------
+RangeVar:
+    Named domain (1D grid). Behaves like a NumPy array in expressions.
+Payoff:
+    Labeled data series produced from either an ndarray or a callable over the domain.
+    Optional mask => piecewise region (outside rendered as NaN gaps).
+    Optional highlight_x list marks specific x values (if inside mask).
+VerticalLine:
+    Simple structural marker drawn over each subplot.
+
+Primary Functions
+-----------------
+plot_payoffs(payoffs, ...):
+    Plot a single group of payoffs (optionally with vertical lines) sharing one domain.
+plot_panels(panels, ...):
+    Create subplots (each panel has its own domain/payoffs/settings).
+
+Future Work
+-----------
+- Build utility wrappers later (e.g. for European call: Payoff('Call', call(S,K), ...)).
+"""
+from dataclasses import dataclass
+from typing import Callable, Sequence, Optional, Union, List, Tuple
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
 import numpy as np
 import matplotlib.pyplot as plt
 
-# --- Data classes ---
+ArrayFunc = Callable[[np.ndarray], np.ndarray]
+MaskType = Union[np.ndarray, Callable[[np.ndarray], np.ndarray]]
+
+# -----------------------------------------------------------------------------
+# Range variable
+# -----------------------------------------------------------------------------
 @dataclass
-class PiecewiseLine:
-    y_func: Callable[[np.ndarray], np.ndarray]
-    cond_func: Callable[[np.ndarray], np.ndarray] = lambda x: x == x
-    label: str = ""
-    highlight_x: Optional[List[float]] = None
+class RangeVar:
+    name: str
+    values: np.ndarray  # 1D
+    __array_priority__ = 1000
+
+    def __array__(self):  # allow numpy ops directly
+        return self.values
+
+    @classmethod
+    def linspace(cls, name: str, start: float, stop: float, num: int) -> RangeVar:
+        return cls(name, np.linspace(start, stop, num))
+
+    @classmethod
+    def arange(cls, name: str, start: float, stop: float, step: float) -> RangeVar:
+        return cls(name, np.arange(start, stop + 1e-12, step))
+
+# -----------------------------------------------------------------------------
+# Payoff (with optional mask, highlight, color)
+# -----------------------------------------------------------------------------
+@dataclass
+class Payoff:
+    label: str
+    data: Union[np.ndarray, ArrayFunc]
+    domain: RangeVar
+    mask: Optional[MaskType] = None
+    highlight_x: Optional[Sequence[float]] = None
     color: Optional[str] = None
 
+    def evaluate(self) -> np.ndarray:
+        x = self.domain.values
+        y = self.data(x) if callable(self.data) else self.data
+        y = np.asarray(y, dtype=float)
+        if y.shape != x.shape:
+            raise ValueError(f"Payoff '{self.label}' shape {y.shape} does not match domain {x.shape}")
+        if self.mask is not None:
+            m = self.mask(x) if callable(self.mask) else self.mask
+            m = np.asarray(m, dtype=bool)
+            if m.shape != x.shape:
+                raise ValueError(f"Mask for '{self.label}' shape {m.shape} mismatch with domain {x.shape}")
+            # set values outside mask to NaN (gap)
+            y = np.where(m, y, np.nan)
+        return y
+
+# -----------------------------------------------------------------------------
+# Structural (vertical lines)
+# -----------------------------------------------------------------------------
 @dataclass
 class VerticalLine:
     x: float
-    label: str = ""
+    label: str = ''
     color: Optional[str] = None
+    linestyle: str = '--'
+    linewidth: float = 1.0
 
+# -----------------------------------------------------------------------------
+# Single-panel plotting
+# -----------------------------------------------------------------------------
 
-def HorizontalLine(
-    y: float,
-    cond_func: Callable[[np.ndarray], np.ndarray],
-    label: str = "",
-    highlight_x: Optional[List[float]] = None,
-    color: Optional[str] = None,
-) -> PiecewiseLine:
-    return PiecewiseLine(
-        y_func=lambda x: np.full_like(x, y),
-        cond_func=cond_func,
-        label=label,
-        highlight_x=highlight_x,
-        color=color,
-    )
+def plot_payoffs(payoffs: Sequence[Payoff], *, title: str = 'Payoff Diagram',
+                 xlabel: Optional[str] = None, ylabel: str = 'Payoff',
+                 vlines: Optional[Sequence[VerticalLine]] = None,
+                 x_min: Optional[float] = None, x_max: Optional[float] = None,
+                 y_min: Optional[float] = None, y_max: Optional[float] = None,
+                 axis_color: str = 'black', axis_width: float = 1.2, grid: bool = True,
+                 show_x_ticks: bool = True, show_y_ticks: bool = True,
+                 figure: Optional[Figure] = None, ax: Optional[Axes] = None) -> Tuple[Figure, Axes]:
+    if not payoffs:
+        raise ValueError('No payoffs provided')
+    domain = payoffs[0].domain
+    for p in payoffs[1:]:
+        if p.domain is not domain:
+            raise ValueError('All payoffs must share the *same* RangeVar instance')
+    x = domain.values
 
+    if ax is None or figure is None:
+        figure, ax = plt.subplots()
 
-PlotItem = Union[PiecewiseLine, VerticalLine]
+    # Plot payoffs
+    for p in payoffs:
+        y = p.evaluate()
+        ax.plot(x, y, label=p.label, color=p.color)
+        if p.highlight_x:
+            for xv in p.highlight_x:
+                # Only plot highlight if xv within domain range and (if masked) inside mask
+                if x[0] <= xv <= x[-1]:
+                    y_val = p.data(np.array([xv]))[0] if callable(p.data) else np.interp(xv, x, y, left=np.nan, right=np.nan)
+                    if not np.isnan(y_val):
+                        ax.plot(xv, y_val, 'o', color=p.color)
 
-# --- Subplot configuration class ---
+    # Vertical lines
+    if vlines:
+        for vl in vlines:
+            ax.axvline(vl.x, color=vl.color, linestyle=vl.linestyle, linewidth=vl.linewidth, label=vl.label)
+
+    # Axes formatting
+    if x_min is None: x_min = float(x[0])
+    if x_max is None: x_max = float(x[-1])
+    ax.set_xlim(x_min, x_max)
+    if y_min is not None and y_max is not None:
+        ax.set_ylim(y_min, y_max)
+    ax.axhline(0, color=axis_color, linestyle=':', linewidth=axis_width)
+    ax.axvline(0, color=axis_color, linestyle=':', linewidth=axis_width)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel or domain.name)
+    ax.set_ylabel(ylabel)
+
+    if not show_x_ticks:
+        ax.set_xticks([])
+    if not show_y_ticks:
+        ax.set_yticks([])
+
+    if any(p.label for p in payoffs) or (vlines and any(v.label for v in vlines)):
+        ax.legend()
+    if grid:
+        ax.grid(True, alpha=0.25)
+    return figure, ax
+
+# -----------------------------------------------------------------------------
+# Multi-panel support
+# -----------------------------------------------------------------------------
 @dataclass
-class SubplotConfig:
-    """Configuration for a single subplot"""
-    lines: Sequence[PlotItem]
-    x_min: float = -10
-    x_max: float = 10
+class Panel:
+    payoffs: Sequence[Payoff]
+    vlines: Sequence[VerticalLine] | None = None
+    title: str = ''
+    x_min: Optional[float] = None
+    x_max: Optional[float] = None
     y_min: Optional[float] = None
     y_max: Optional[float] = None
-    title: str = ""
-    xlabel: str = "x"
-    ylabel: str = "y"
+    xlabel: Optional[str] = None
+    ylabel: Optional[str] = None
 
-# --- Core plotting function ---
-def _plot_on_axes(
-    ax: plt.Axes,
-    config: SubplotConfig,
-    axis_color: str = "black",
-    axis_width: float = 1.5,
-):
-    """Plot on given axes using SubplotConfig"""
-    x = np.linspace(config.x_min, config.x_max, 1000)
-    
-    for item in config.lines:
-        c = item.color
-        if isinstance(item, PiecewiseLine):
-            mask = item.cond_func(x)
-            y = np.full_like(x, np.nan, dtype=float)
-            y[mask] = item.y_func(x[mask])
-            ax.plot(x, y, label=item.label, color=c)
-
-            if item.highlight_x:
-                for xp in item.highlight_x:
-                    xp_arr = np.array([xp])
-                    if item.cond_func(xp_arr)[0]:
-                        yp = item.y_func(xp_arr)[0]
-                        ax.plot(xp, yp, "o", color=c)
-                        ax.annotate(
-                            f"({xp}, {yp:.2f})",
-                            (xp, yp),
-                            textcoords="offset points",
-                            xytext=(5, 5),
-                            fontsize=8,
-                            color=c,
-                        )
-
-        elif isinstance(item, VerticalLine):
-            ymin_, ymax_ = (config.y_min, config.y_max) if (
-                config.y_min is not None and config.y_max is not None
-            ) else ax.get_ylim()
-            ax.vlines(item.x, ymin_, ymax_, label=item.label, color=c)
-
-    ax.set_xlim(config.x_min, config.x_max)
-    if config.y_min is not None and config.y_max is not None:
-        ax.set_ylim(config.y_min, config.y_max)
-
-    # Dotted axes
-    ax.axhline(0, color=axis_color, linewidth=axis_width, linestyle=":")
-    ax.axvline(0, color=axis_color, linewidth=axis_width, linestyle=":")
-
-    ax.grid(True)
-    if any(item.label for item in config.lines):
-        ax.legend()
-    ax.set_xlabel(config.xlabel)
-    ax.set_ylabel(config.ylabel)
-    ax.set_title(config.title)
-
-# --- Public plotting function ---
-def plot_lines(
-    lines: Sequence[PlotItem],
-    x_min: float = -10,
-    x_max: float = 10,
-    y_min: Optional[float] = None,
-    y_max: Optional[float] = None,
-    title: str = "Piecewise Line Plot",
-    xlabel: str = "x",
-    ylabel: str = "y",
-    axis_color: str = "black",
-    axis_width: float = 1.5,
-) -> Tuple[plt.Figure, plt.Axes]:
-    """Public function for single plot"""
-    config = SubplotConfig(
-        lines=lines,
-        x_min=x_min,
-        x_max=x_max,
-        y_min=y_min,
-        y_max=y_max,
-        title=title,
-        xlabel=xlabel,
-        ylabel=ylabel
-    )
-    
-    fig, ax = plt.subplots()
-    _plot_on_axes(ax, config, axis_color, axis_width)
-    return fig, ax
-
-# --- Combined subplot function ---
-def plot_combined(
-    subplot_configs: Sequence[SubplotConfig],
-    nrows: int,
-    ncols: int,
-    figsize: Tuple[float, float] = (12, 8),
-    main_title: Optional[str] = None,
-    axis_color: str = "black",
-    axis_width: float = 1.5,
-) -> Tuple[plt.Figure, np.ndarray]:
-    """
-    Create combined subplots from multiple SubplotConfig objects
-    
-    Args:
-        subplot_configs: Sequence of SubplotConfig objects
-        nrows: Number of rows in subplot grid
-        ncols: Number of columns in subplot grid
-        figsize: Overall figure size
-        main_title: Optional title for entire figure
-        axis_color: Color for dotted axes
-        axis_width: Width for dotted axes
-    
-    Returns:
-        (fig, axes) tuple
-    """
+def plot_panels(panels: Sequence[Panel], *, nrows: int, ncols: int,
+                figsize: Tuple[float, float] = (12, 8), main_title: Optional[str] = None,
+                share_y: bool = False) -> Tuple[Figure, np.ndarray]:
+    if len(panels) > nrows * ncols:
+        raise ValueError('More panels than subplot slots')
     fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
-    axes_flat = axes.flatten()
-    
-    # Plot each subplot configuration
-    for i, config in enumerate(subplot_configs):
-        if i < len(axes_flat):
-            _plot_on_axes(
-                axes_flat[i], 
-                config, 
-                axis_color, 
-                axis_width
-            )
-    
-    # Hide unused axes
-    for j in range(i + 1, len(axes_flat)):
-        axes_flat[j].axis('off')
-    
+    flat = axes.ravel()
+
+    # Optional shared y-range
+    if share_y:
+        ymins, ymaxs = [], []
+        for pnl in panels:
+            for p in pnl.payoffs:
+                y = p.evaluate()
+                finite = y[np.isfinite(y)]
+                if finite.size:
+                    ymins.append(finite.min()); ymaxs.append(finite.max())
+        if ymins:
+            global_ymin, global_ymax = min(ymins), max(ymaxs)
+        else:
+            global_ymin = global_ymax = None
+    else:
+        global_ymin = global_ymax = None
+
+    for i, pnl in enumerate(panels):
+        ax = flat[i]
+        plot_payoffs(list(pnl.payoffs), vlines=pnl.vlines, title=pnl.title, 
+                     xlabel=pnl.xlabel, ylabel=pnl.ylabel or (pnl.xlabel and ''), # type: ignore
+                     x_min=pnl.x_min, x_max=pnl.x_max, 
+                     y_min=(global_ymin if share_y else pnl.y_min), 
+                     y_max=(global_ymax if share_y else pnl.y_max), ax=ax, figure=fig)
+    for ax in flat[len(panels):]:
+        ax.axis('off')
     if main_title:
-        fig.suptitle(main_title, fontsize=16)
-    
-    fig.tight_layout()
-    if main_title:
-        fig.subplots_adjust(top=0.92)
-        
+        fig.suptitle(main_title)
+        fig.tight_layout(); fig.subplots_adjust(top=0.9)
+    else:
+        fig.tight_layout()
     return fig, axes
